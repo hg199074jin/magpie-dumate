@@ -52,6 +52,9 @@ OpenCode & Magpie provider plugin for **Baidu DuMate（百度搭子，qianfan �
   `X-Dumate-Account-Id`，取自当前登录态，缺失回落 `global`）；模型名路由
   （`[1M]` 后缀剥离、`glm-5→glm-53` 版本替代带诊断头、未知模型显式拒绝）；
   `max_tokens` 预算钳制与 400 上限自学习（见「预算钳制与模型路由」）。
+- **限流节流（0.5.1）**：云端用户级 429 不再硬失败——软冷却记账（Retry-After 优先、
+  指数退避封顶 2h、冷却中不叠加、成功清零）、短窗口本地等待重发、长窗口快速失败并
+  附 `Retry-After` + `X-Magpie-Dumate-Retryable` 头、在途并发帽压平突发（见「限流节流」）。
 - **每日签到**：magpie `checkin` hook，自动领取每日登录积分（数额以接口差额实时计算，Settings → Usage → Plugins 开关）。
 - **余额展示**：magpie `usage` hook，在 Usage 页显示剩余/总积分、最近到期积分包。
 - **三种登录方式**：
@@ -178,8 +181,8 @@ nothing is installed"），所以以后改 `index.mjs` 只要重载就生效，�
 ## 测试
 
 ```bash
-node run-tests.mjs --quick   # 23 个离线套件，不联网不耗积分（约 2 分钟）
-node run-tests.mjs           # 全部 35 套件（真实调用网关，消耗少量积分）
+node run-tests.mjs --quick   # 24 个离线套件，不联网不耗积分（约 2 分钟）
+node run-tests.mjs           # 全部 36 套件（真实调用网关，消耗少量积分）
 node run-tests.mjs test-smoke test-stress   # 只跑指定套件
 node run-tests.mjs --quick test-unit test-static   # 只跑指定离线套件（秒级）
 ```
@@ -214,6 +217,7 @@ node run-tests.mjs --quick test-unit test-static   # 只跑指定离线套件（
 | test-docs-audit | README 与 runner/模型/bug 记录的一致性自检 |
 | test-request-transform | 0.5.0 请求变换：身份头注入/防伪造/模型路由/未知拒绝/[1M]（全离线 mock） |
 | test-budget-clamp | 0.5.0 预算钳制：floor/cap 矩阵/策略开关/400 上限学习/缓存卫生（全离线 mock） |
+| test-ratelimit | 0.5.1 限流节流：429 软冷却/Retry-After 优先/冷却不叠加/成功清零/并发帽/集成透传（全离线 mock） |
 | test-smoke | 全链路冒烟 |
 | test-stream-tools | SSE / tool_calls / 大 payload / 错误格式 |
 | test-concurrency | 并发 / 坏凭据 401 / 缓存复用 |
@@ -325,6 +329,26 @@ reasoning_tokens 方向是否稳定），然后只改 `reasoning.mjs` 的 `REASO
 TTL 7 天，损坏自愈，分析窗有界 8KB）。只学习不重试：本版本撞到 400 后记录上限、
 透传错误，下一次请求自动受益。写盘失败静默降级，绝不影响本次响应。
 
+### 限流节流（0.5.1）
+
+云端网关对单账号有**用户级突发限流**（`user_rate_limit_exceeded`：短窗口连发即 429，
+滚动窗口约 20 分钟恢复；日额度本身按订阅等级计，充裕）。0.5.0 及之前插件把 429 原样
+透传且无可重试信号（magpie 显示 retryable=false 硬失败）。0.5.1 把「撞了之后怎么办」
+工程化（机制移植自 dumate2api 的账号池状态机，裁剪到单账号形态）：
+
+- **软冷却记账**：429 → 冷却 base 5min × 2^连续次数，封顶 2h。三条纪律：
+  上游 `Retry-After` 头优先（夹在 [1s, 2h]，不递增退避指数——时长是上游定的）；
+  冷却中再收 429 不延长窗口；一次成功清零退避。
+- **短窗口本地等待**：冷却剩余 ≤ 10s 时插件自己等完再发（用户无感）；
+- **长窗口快速失败 + 可重试信号**：剩余 > 10s 时立即返回 429，响应保证带
+  `Retry-After`（上游值或冷却剩余）与 `X-Magpie-Dumate-Retryable: 1` 头——
+  magpie 据此带退避重试，而不是当成不可恢复错误。
+- **在途并发帽**：单账号同时最多 2 个出站请求，满时等待释放（≤10s）再发——
+  「几十秒内连发多条」的突发在本地被压平，不再触发云端限流。
+- **冷却内的并发请求**：不打上游（零配额消耗），直接本地 429 + 相同退避头。
+- `MAGPIE_DUMATE_THROTTLE=off` 整体关闭（原始透传退出路径）。
+- 冷却状态是进程内存态：插件进程重启即清零（上游滚动窗口本来就会自愈，无需持久化）。
+
 配置文件里的 `127.0.0.1` 是 DuMate 内置 OpenCode 的本地代理，不是卸载后还能用的云端 API。
 本插件只请求 `dumate-svc.baidu.com` 的官方 chat 端点，拒绝其他地址与重定向。
 快照只解决「模型清单还在」，**不延长登录有效期**：本次只离线验证了源文件缺失时清单仍能加载，
@@ -339,7 +363,8 @@ TTL 7 天，损坏自愈，分析窗有界 8KB）。只学习不重试：本版�
   `models.snapshot.json`（模型元数据快照，0600）与 0.5.0 新增的 `caps.json`
   （模型输出上限缓存，0600，目录 0700）。两者都只有元数据——不含 Cookie、token、
   apiKey、prompt 或任何 endpoint；`index.mjs` 依然零写文件调用，全部写盘收敛在
-  `budget.mjs`/`models.mjs`，「插件只读 DuMate 登录态」的承诺不变。
+  `budget.mjs`/`models.mjs`，「插件只读 DuMate 登录态」的承诺不变。0.5.1 的限流
+  冷却态是**纯内存**（进程重启即清零），不新增任何持久化文件。
 - 三个出站请求（token/积分 ×2 + 聊天）都用 `redirect: "manual"`：绝不带 Cookie / gateway token
   跟随重定向，同时保留 3xx 响应并判为登录失效。直接用 `redirect: "error"` 会让坏凭据
   退化成普通 502、丢掉 `signIn=expired`——这个回归是本次全量测试抓到后修掉的。
@@ -359,6 +384,21 @@ TTL 7 天，损坏自愈，分析窗有界 8KB）。只学习不重试：本版�
 | `dumate-svc.baidu.com/gateway/apis/v1/chat/completions` | POST | 模型调用（消耗积分） |
 
 ## 变更记录
+
+### 0.5.1（2026-11-18 限流节流：429 从硬失败变成自动退避）
+
+真实事故驱动：magpie 用户撞云端 `user_rate_limit_exceeded` 时看到的是
+`retryable=false` 硬失败。0.5.1 把 429 变成可恢复事件（机制移植自
+[dumate2api](https://github.com/wearetheone777/dumate2api) 的账号池状态机，
+裁剪到单账号形态，全部收敛在新模块 `ratelimit.mjs`）：
+
+- **软冷却记账**：429 → 冷却 base 5min × 2^streak 封顶 2h；上游 `Retry-After`
+  优先（不递增指数）；冷却中不叠加；成功清零。
+- **gate**：剩余 ≤10s 本地等待后放行（用户无感）；>10s 快速失败并保证响应带
+  `Retry-After` + `X-Magpie-Dumate-Retryable: 1`（宿主可带退避重试）。
+- **在途并发帽**（默认 2）压平突发；冷却内并发请求不打上游（零配额消耗）。
+- `MAGPIE_DUMATE_THROTTLE=off` 关闭；冷却态纯内存不落盘。
+- 12 个新离线用例（注入时钟零真实等待）；无新真实网关请求。
 
 ### 0.5.0（2026-11-17 请求变换三件套：身份头 / 预算钳制 / 模型路由与上限学习）
 

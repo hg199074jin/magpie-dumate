@@ -34,6 +34,7 @@ import { desktopUserDataDir } from "./paths.mjs"
 import { loadModels } from "./models.mjs"
 import { applyReasoning, pickEffort } from "./reasoning.mjs"
 import { routeModel, applyBudget, loadCaps, saveCap, capsPath, tapLearningStream, LEARN_READ_CAP } from "./budget.mjs"
+import { createRateLimiter, parseRetryAfterMs } from "./ratelimit.mjs"
 
 const PROVIDER_ID = "dumate"
 const PROVIDER_NAME = "百度搭子 DuMate"
@@ -129,6 +130,24 @@ function iconFromBundle() {
 
 // Evaluated once at load, in the documented preference order.
 const pluginIcon = iconFromPluginDir() || iconFromDesktopApp() || iconFromBundle()
+
+// v0.5.1: a 429 from the gateway must never surface as a dead end. Every
+// rate-limited response carries `Retry-After` (upstream's own value when it
+// sent one, else the plugin's soft-cooldown remainder) and the Retryable tag
+// so magpie knows the request can simply be retried later.
+function rateLimitedResponse(retryAfterMs, upstream = null) {
+  const seconds = Math.max(1, Math.ceil(Number(retryAfterMs || 0) / 1000))
+  if (upstream) {
+    const h = new Headers(upstream.headers)
+    if (!h.has("retry-after")) h.set("Retry-After", String(seconds))
+    h.set("X-Magpie-Dumate-Retryable", "1")
+    return new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers: h })
+  }
+  return new Response(
+    JSON.stringify({ error: { code: "user_rate_limit_exceeded", message: `DuMate 用户级限流冷却中（插件已自动退避，约 ${seconds}s 后恢复）`, type: "rate_limit_error" } }),
+    { status: 429, headers: { "Content-Type": "application/json", "Retry-After": String(seconds), "X-Magpie-Dumate-Retryable": "1" } },
+  )
+}
 
 function readDesktopLogin() {
   try {
@@ -516,6 +535,11 @@ export const DuMatePlugin = async (input = {}) => {
           return trusted
         }
         const capsFile = capsPath({ stateDir: input.directory })
+        // v0.5.1 rate limiting (dumate2api's soft-cooldown discipline, single
+        // account form): upstream 429s are remembered so concurrent callers
+        // back off together instead of stampeding; short Retry-After windows
+        // are waited out locally; over-cap concurrency is held at the plugin.
+        const limiter = createRateLimiter({ env: process.env })
         return {
           baseURL: GATEWAY_BASE,
           apiKey: "dumate",
@@ -576,6 +600,15 @@ export const DuMatePlugin = async (input = {}) => {
               // bodyText is not JSON (or not readable as one) — passthrough.
             }
             let cred
+            // v0.5.1 rate limiting: wait out (or fast-fail with a precise
+            // Retry-After) any active 429 cooldown first. The gateway token is
+            // fetched BEFORE the in-flight slot on purpose: the token endpoint
+            // is a console API, not the rate-limited chat path, so concurrent
+            // callers share the single-flight token fetch instead of being
+            // spread into batches that each re-fetch (breaks the token
+            // cache's 5-minute-margin semantics at expiry boundaries).
+            const gate = await limiter.gate()
+            if (!gate.ok) return rateLimitedResponse(gate.retryAfterMs)
             try {
               cred = await fetchGatewayToken(cookieHeaderOf(cookies))
             } catch (e) {
@@ -585,6 +618,10 @@ export const DuMatePlugin = async (input = {}) => {
                 { status: expired ? 401 : 502, headers: { "Content-Type": "application/json", "X-Magpie-Sign-In": expired ? "expired" : "kept" } },
               )
             }
+            const slot = limiter.acquire()
+            const held = await (slot.wait ?? Promise.resolve(slot))
+            if (!held.ok) return rateLimitedResponse(held.retryAfterMs)
+            const releaseSlot = held.release
             const headers = inbound
             headers.set("Authorization", `Bearer ${cred.token}`)
             headers.set("Content-Type", "application/json")
@@ -592,16 +629,21 @@ export const DuMatePlugin = async (input = {}) => {
             headers.set("X-Dumate-Account-Id", accountId)
             headers.delete("x-api-key")
             headers.delete("content-length")
-            const res = await fetch(req ? req.url : input, {
-              ...init,
-              method: init?.method ?? req?.method ?? "POST",
-              headers,
-              body: bodyText,
-              // Same rule as the console calls: never follow a redirect with
-              // the gateway token, but keep the 3xx so it can be reported as
-              // an expired session instead of an unhandled network error.
-              redirect: "manual",
-            })
+            let res
+            try {
+              res = await fetch(req ? req.url : input, {
+                ...init,
+                method: init?.method ?? req?.method ?? "POST",
+                headers,
+                body: bodyText,
+                // Same rule as the console calls: never follow a redirect with
+                // the gateway token, but keep the 3xx so it can be reported as
+                // an expired session instead of an unhandled network error.
+                redirect: "manual",
+              })
+            } finally {
+              releaseSlot()
+            }
             if ((res.status >= 300 && res.status < 400) || res.status === 401) {
               tokenCache.delete(cookieHeaderOf(cookies))
               return new Response(
@@ -609,6 +651,14 @@ export const DuMatePlugin = async (input = {}) => {
                 { status: 401, headers: { "Content-Type": "application/json", "X-Magpie-Sign-In": "expired" } },
               )
             }
+            // 429 → remember the cooldown (Retry-After first, else bounded
+            // exponential backoff) and hand the caller the upstream body with
+            // a guaranteed Retry-After + retryable tag — a pause, not a dead end.
+            if (res.status === 429) {
+              limiter.noteRateLimited(parseRetryAfterMs(res.headers.get("retry-after")))
+              return rateLimitedResponse(limiter.cooldownRemaining(), res)
+            }
+            if (res.status < 300) limiter.noteSuccess()
             // 400 with a max_tokens range error → learn the cap for the
             // outbound model via a streaming side-channel (GPT-REVIEW-V050-R3):
             // the body's original bytes pass through a TransformStream untouched
