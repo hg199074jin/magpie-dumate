@@ -16,6 +16,17 @@ import { discoverConfig } from "./paths.mjs"
 // installed side by side and must not overwrite each other's snapshot.
 export const SNAPSHOT_DIR_NAME = "magpie-dumate"
 
+// v0.5.2：目录声明的 context 以实测为准的下调表（键 = 模型 id，小写）。
+//
+// 事故证据（2026-11-18，本机 magpie usage.jsonl）：`deepseek-v41-flash` 在输入
+// 52.3 万 tokens 时正常（stop=tool_calls），57.5 万起连续 4 次返回 out=47 tokens、
+// stop=content_filter（上游把回答替换成固定话术）。注册表宣称的 1000k 与实测
+// 安全区不符——**不是**上游硬上限，只是注册表值。下调到 512k 让宿主（ZCode/Codex）
+// 在安全区内先压缩上下文，避免请求撞上内容过滤。阈值机制 UNKNOWN，取 512k 留余量。
+export const SAFE_CONTEXT_CAPS = {
+  "deepseek-v41-flash": 512_000,
+}
+
 const validId = (id) => typeof id === "string" && /^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,159}$/.test(id)
 const positive = (n) => Number.isSafeInteger(n) && n > 0
 const modalities = (list) => Array.isArray(list)
@@ -62,9 +73,12 @@ export function importModels(config) {
       excluded++
       continue
     }
-    const context = value.limit?.context ?? value.limit?.input
+    let context = value.limit?.context ?? value.limit?.input
     const output = value.limit?.output
     if (!positive(context) || !positive(output)) continue
+    // v0.5.2：实测安全上限优先于注册表宣称值（见 SAFE_CONTEXT_CAPS 的注释）。
+    const safeCap = SAFE_CONTEXT_CAPS[String(key).toLowerCase()] ?? SAFE_CONTEXT_CAPS[String(id).toLowerCase()]
+    if (positive(safeCap)) context = Math.min(context, safeCap)
     const input = modalities(value.modalities?.input)
     if (!input.includes("text")) continue
     const variants = REASONING[id]

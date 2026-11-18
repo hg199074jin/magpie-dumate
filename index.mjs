@@ -35,6 +35,7 @@ import { loadModels } from "./models.mjs"
 import { applyReasoning, pickEffort } from "./reasoning.mjs"
 import { routeModel, applyBudget, loadCaps, saveCap, capsPath, tapLearningStream, LEARN_READ_CAP } from "./budget.mjs"
 import { createRateLimiter, parseRetryAfterMs } from "./ratelimit.mjs"
+import { tapContentFilter, isContentFiltered, GUARDED_MODELS, FILTER_MESSAGE } from "./contentguard.mjs"
 
 const PROVIDER_ID = "dumate"
 const PROVIDER_NAME = "百度搭子 DuMate"
@@ -682,6 +683,45 @@ export const DuMatePlugin = async (input = {}) => {
                 return new Response(body, { status: 400, statusText: res.statusText, headers })
               }
               return res
+            }
+            // v0.5.2 content-filter guard (scoped to models with live evidence —
+            // see contentguard.mjs): the upstream replaces its answer with a canned
+            // line when the request trips its content filter (observed on
+            // deepseek-v41-flash past ~550k input tokens). Instead of letting the
+            // user read a mysterious non-answer, stream a short explanatory notice
+            // before [DONE] (streaming, bytes otherwise untouched) or answer 422
+            // with the same explanation (non-streaming). Off with
+            // MAGPIE_DUMATE_CONTENT_GUARD=off; models outside GUARDED_MODELS are
+            // never touched.
+            const guardOn = String(process.env.MAGPIE_DUMATE_CONTENT_GUARD ?? "").trim().toLowerCase() !== "off"
+            if (guardOn && outboundModel && GUARDED_MODELS.has(outboundModel.toLowerCase()) && res.status === 200) {
+              const streaming = /text\/event-stream/i.test(res.headers.get("content-type") ?? "")
+              if (streaming && res.body) {
+                const headers = new Headers(res.headers)
+                if (routeNote) headers.set("X-Magpie-Dumate-Route", routeNote)
+                return new Response(tapContentFilter(res, {}), { status: res.status, statusText: res.statusText, headers })
+              }
+              try {
+                const text = await res.text()
+                let payload = null
+                try { payload = JSON.parse(text) } catch {
+                  // not JSON — passthrough below
+                }
+                const headers = new Headers(res.headers)
+                if (routeNote) headers.set("X-Magpie-Dumate-Route", routeNote)
+                if (isContentFiltered(payload)) {
+                  headers.delete("content-length")
+                  headers.set("Content-Type", "application/json")
+                  return new Response(
+                    JSON.stringify({ error: { message: FILTER_MESSAGE, type: "content_filtered" } }),
+                    { status: 422, statusText: "Unprocessable Content", headers },
+                  )
+                }
+                headers.delete("content-length")
+                return new Response(text, { status: res.status, statusText: res.statusText, headers })
+              } catch {
+                // Body unreadable — fall through with the original response.
+              }
             }
             if (routeNote) {
               // Tag the response without buffering it: streaming bodies pass

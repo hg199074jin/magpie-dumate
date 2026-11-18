@@ -55,6 +55,10 @@ OpenCode & Magpie provider plugin for **Baidu DuMate（百度搭子，qianfan �
 - **限流节流（0.5.1）**：云端用户级 429 不再硬失败——软冷却记账（Retry-After 优先、
   指数退避封顶 2h、冷却中不叠加、成功清零）、短窗口本地等待重发、长窗口快速失败并
   附 `Retry-After` + `X-Magpie-Dumate-Retryable` 头、在途并发帽压平突发（见「限流节流」）。
+- **内容过滤可解释（0.5.2）**：上游在超长上下文下把回答替换成固定话术时，不再让用户
+  看到莫名其妙的"答非所问"——流式注入一条说明、非流式返回 422 建议；同时把
+  `deepseek-v41-flash` 的目录上下文从注册表宣称的 1000k 下调到实测安全的 512k
+  （见「内容过滤与上下文安全区」）。
 - **每日签到**：magpie `checkin` hook，自动领取每日登录积分（数额以接口差额实时计算，Settings → Usage → Plugins 开关）。
 - **余额展示**：magpie `usage` hook，在 Usage 页显示剩余/总积分、最近到期积分包。
 - **三种登录方式**：
@@ -181,8 +185,8 @@ nothing is installed"），所以以后改 `index.mjs` 只要重载就生效，�
 ## 测试
 
 ```bash
-node run-tests.mjs --quick   # 24 个离线套件，不联网不耗积分（约 2 分钟）
-node run-tests.mjs           # 全部 36 套件（真实调用网关，消耗少量积分）
+node run-tests.mjs --quick   # 25 个离线套件，不联网不耗积分（约 2 分钟）
+node run-tests.mjs           # 全部 37 套件（真实调用网关，消耗少量积分）
 node run-tests.mjs test-smoke test-stress   # 只跑指定套件
 node run-tests.mjs --quick test-unit test-static   # 只跑指定离线套件（秒级）
 ```
@@ -218,6 +222,7 @@ node run-tests.mjs --quick test-unit test-static   # 只跑指定离线套件（
 | test-request-transform | 0.5.0 请求变换：身份头注入/防伪造/模型路由/未知拒绝/[1M]（全离线 mock） |
 | test-budget-clamp | 0.5.0 预算钳制：floor/cap 矩阵/策略开关/400 上限学习/缓存卫生（全离线 mock） |
 | test-ratelimit | 0.5.1 限流节流：429 软冷却/Retry-After 优先/冷却不叠加/成功清零/并发帽/集成透传（全离线 mock） |
+| test-content-guard | 0.5.2 上游内容过滤：目录上下文上限/流式提示注入/非流式 422/范围与开关（全离线 mock） |
 | test-smoke | 全链路冒烟 |
 | test-stream-tools | SSE / tool_calls / 大 payload / 错误格式 |
 | test-concurrency | 并发 / 坏凭据 401 / 缓存复用 |
@@ -349,6 +354,26 @@ TTL 7 天，损坏自愈，分析窗有界 8KB）。只学习不重试：本版�
 - `MAGPIE_DUMATE_THROTTLE=off` 整体关闭（原始透传退出路径）。
 - 冷却状态是进程内存态：插件进程重启即清零（上游滚动窗口本来就会自愈，无需持久化）。
 
+### 内容过滤与上下文安全区（0.5.2）
+
+该网关在**超长上下文**下会把回答替换成固定话术（`finish_reason: "content_filter"`，
+输出约 47 tokens），用户侧表现为"莫名其妙答非所问"。本机实测（2026-11-18）：
+
+| 模型 | 输入 tokens | 结果 |
+|---|---|---|
+| `glm-53` | 532,401 | 正常（`stop`） |
+| `deepseek-v41-flash` | 6,433 | 正常（`tool_calls`） |
+| `deepseek-v41-flash` | 523,373 | 正常 |
+| `deepseek-v41-flash` | 575,993 / 578,759 / 582,119 / 587,281 | **`content_filter` + 47 tokens** |
+
+因此：
+
+- 目录里 `deepseek-v41-flash` 的上下文从注册表宣称的 **1000k 下调到 512k**——注册表
+  值是"模型宣称"，不是"该网关实测可用"，宿主据此提前压缩上下文；
+- 万一仍然撞上过滤，插件给出可解释信号：流式在 `[DONE]` 前注入一条说明（原始字节零
+  改动），非流式返回 **422**（`type: content_filtered`）并建议开新会话或改用 glm-53；
+- 范围仅 `deepseek-v41-flash`；`MAGPIE_DUMATE_CONTENT_GUARD=off` 可关闭。
+
 配置文件里的 `127.0.0.1` 是 DuMate 内置 OpenCode 的本地代理，不是卸载后还能用的云端 API。
 本插件只请求 `dumate-svc.baidu.com` 的官方 chat 端点，拒绝其他地址与重定向。
 快照只解决「模型清单还在」，**不延长登录有效期**：本次只离线验证了源文件缺失时清单仍能加载，
@@ -384,6 +409,23 @@ TTL 7 天，损坏自愈，分析窗有界 8KB）。只学习不重试：本版�
 | `dumate-svc.baidu.com/gateway/apis/v1/chat/completions` | POST | 模型调用（消耗积分） |
 
 ## 变更记录
+
+### 0.5.2（2026-11-18 上游内容过滤：从"莫名答非所问"变成可解释）
+
+真实事故驱动（本机 magpie `usage.jsonl` 实证）：会话上下文涨到约 58.7 万 tokens 后，
+`dumate/deepseek-v41-flash` 连续 4 次返回 `out=47` tokens、`stop=content_filter`——
+上游把回答替换成固定话术「作为一个人工智能语言模型，我还没学习如何回答这个问题…」，
+用户侧只看到"答非所问"，没有任何线索指向内容过滤。同一模型 6.4k 输入正常
+（`out=1948`），`glm-53` 53 万输入正常。
+
+- **目录上下文下调**：`deepseek-v41-flash` 从注册表宣称的 1000k → **512k**
+  （实测 52.3 万正常、57.5 万起失败；阈值机制 UNKNOWN，取 512k 留余量）。宿主因此
+  会在安全区内先压缩上下文，从源头避免撞上过滤。
+- **过滤可解释**：命中 `content_filter` 时，流式在 `[DONE]` 前注入一条说明事件
+  （原始字节零改动），非流式返回 **422** + 可操作建议（开新会话 / 改用 glm-53）。
+- 作用范围有意收窄：仅对 `deepseek-v41-flash`（有实测证据的模型）；`glm-53` 等其他
+  模型零改动。`MAGPIE_DUMATE_CONTENT_GUARD=off` 关闭。
+- 7 个新离线用例；无新真实网关请求。
 
 ### 0.5.1（2026-11-18 限流节流：429 从硬失败变成自动退避）
 

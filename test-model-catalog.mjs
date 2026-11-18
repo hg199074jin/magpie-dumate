@@ -106,7 +106,12 @@ try {
     }),
   }))
   const m = models["deepseek-v41-flash"]
-  if (m.limit.context !== 1000000 || m.limit.output !== 384000) throw new Error("窗口/输出上限丢失")
+  // v0.5.2 期望变更（证据驱动，非放宽断言）：实测该模型经此网关在 57.5 万输入
+  // 起被上游内容过滤器替换回答（52.3 万仍正常），故目录上下文从注册表宣称的
+  // 1000000 下调到 512000；输出上限不受影响。见 README「内容过滤与上下文安全区」。
+  if (m.limit.context !== 512000 || m.limit.output !== 384000) {
+    throw new Error(`窗口/输出不符 v0.5.2 期望：context=${m.limit.context} output=${m.limit.output}`)
+  }
   if (!m.attachment || m.modalities.input.includes("bogus")) throw new Error("模态处理错误")
   if (!m.reasoning || Object.keys(m.variants ?? {}).join(",") !== "none,low,high,max") throw new Error("四档变体缺失")
   ok("1000000/384000 + 图像输入 + none/low/high/max")
