@@ -211,4 +211,33 @@ try {
   ok("off 开关 + 非受限模型（glm-53）均零改写")
 } catch (e) { fail("保护范围", e) } finally { restore(); delete process.env.MAGPIE_DUMATE_CONTENT_GUARD }
 
+console.log("[F8] 流式提示注入后必须删除 content-length（注入会让声明长度失真）")
+try {
+  const dir = join(tmpdir(), "dumate-cg5-" + Math.random().toString(36).slice(2, 8))
+  mkdirSync(dir, { recursive: true })
+  const plugin = await DuMatePlugin({ directory: dir })
+  const sse =
+    'data: {"choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]}\n\n' +
+    "data: [DONE]\n\n"
+  mock(() => new Response(new ReadableStream({
+    start(c) { c.enqueue(new TextEncoder().encode(sse)); c.close() },
+  }), {
+    status: 200,
+    headers: { "Content-Type": "text/event-stream", "Content-Length": String(sse.length) },
+  }))
+  const loader = await plugin.auth.loader(async () => seat)
+  const r = await loader.fetch(GW, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "deepseek-v41-flash", stream: true, messages: [{ role: "user", content: "hi" }] }),
+  })
+  const out = await r.text()
+  if (!out.includes("上游内容过滤器拦截了本次回答")) throw new Error("提示未注入（前置条件不成立）")
+  const declared = r.headers.get("content-length")
+  if (declared !== null) {
+    throw new Error(`注入后仍保留 content-length=${declared}（实际 ${out.length} 字节，客户端可能截断）`)
+  }
+  rmSync(dir, { recursive: true, force: true })
+  ok("注入提示后 content-length 已删除，实际长度由分块传输决定")
+} catch (e) { fail("content-length 卫生", e) } finally { restore() }
+
 console.log(process.exitCode ? "\n== 有失败项 ==" : "\n== 全部通过 ==")

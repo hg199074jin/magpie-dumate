@@ -698,6 +698,10 @@ export const DuMatePlugin = async (input = {}) => {
               const streaming = /text\/event-stream/i.test(res.headers.get("content-type") ?? "")
               if (streaming && res.body) {
                 const headers = new Headers(res.headers)
+                // The guard may inject a notice event, so a declared length no
+                // longer describes the bytes we send — drop it and let the
+                // client read the stream to its end (chunked).
+                headers.delete("content-length")
                 if (routeNote) headers.set("X-Magpie-Dumate-Route", routeNote)
                 return new Response(tapContentFilter(res, {}), { status: res.status, statusText: res.statusText, headers })
               }
